@@ -78,23 +78,225 @@ const ADAPTERS = {
      from the connections endpoint, sandbox = tenant name contains
      'Demo Company'. Secrets: ACCOUNTING_CLIENT_ID, ACCOUNTING_CLIENT_SECRET.
   */
+  /* WIRED: Xero. Verified against Xero's current docs + the XeroAPI OpenAPI
+     spec, September 2026.
+       - granular scopes only (accounting.reports.read is gone for apps created
+         on/after 2 Mar 2026)
+       - token endpoint takes HTTP Basic client auth -> tokenAuth:'basic'
+       - P&L only; no Journals (premium-gated), no write scopes anywhere
+       - money is read straight off the owner's P&L, ex GST, sections as-is */
   accounting: {
-    configured: false,
-    auth: null, /* 'oauth' | 'token' */
+    configured: true,
+    auth: 'oauth',
     oauth: {
-      /* Example (Xero) - fill these when you wire the adapter:
-         authorizeUrl: 'https://login.xero.com/identity/connect/authorize',
-         tokenUrl: 'https://identity.xero.com/connect/token',
-         scopes: 'offline_access accounting.reports.profitandloss.read',
-         clientIdSecret: 'ACCOUNTING_CLIENT_ID',
-         clientSecretSecret: 'ACCOUNTING_CLIENT_SECRET',
-         tokenAuth: 'basic'   // Xero's token endpoint wants HTTP Basic client auth
-                              // (client_secret_basic). Use 'post' only for providers
-                              // that expect client_id/secret in the form body. */
+      authorizeUrl: 'https://login.xero.com/identity/connect/authorize',
+      tokenUrl: 'https://identity.xero.com/connect/token',
+      scopes: 'offline_access accounting.reports.profitandloss.read',
+      clientIdSecret: 'ACCOUNTING_CLIENT_ID',
+      clientSecretSecret: 'ACCOUNTING_CLIENT_SECRET',
+      tokenAuth: 'basic'
     },
-    async status(env, h) { return { connected: false }; },
-    async fetchRange(env, h, q) { throw new NotConfigured('accounting'); },
-    async fetchMonthly(env, h, q) { throw new NotConfigured('accounting'); }
+
+    /* ---------------- small helpers (this === the adapter) ------------- */
+
+    _r(n) { return Math.round((Number(n) || 0) * 100) / 100; },
+    _num(v) {
+      if (v === null || v === undefined || v === '') return 0;
+      const s = String(v).replace(/[$,\s]/g, '').replace(/^\((.*)\)$/, '-$1');
+      const n = parseFloat(s);
+      return isFinite(n) ? n : 0;
+    },
+    _monthStart(mk) { return mk + '-01'; },
+    _monthEnd(mk) {
+      const y = parseInt(mk.slice(0, 4), 10);
+      const m = parseInt(mk.slice(5, 7), 10);
+      const d = new Date(Date.UTC(y, m, 0));
+      return mk + '-' + String(d.getUTCDate()).padStart(2, '0');
+    },
+    _monthList(fromMonth, toMonth) {
+      const out = [];
+      let y = parseInt(fromMonth.slice(0, 4), 10);
+      let m = parseInt(fromMonth.slice(5, 7), 10);
+      const ey = parseInt(toMonth.slice(0, 4), 10);
+      const em = parseInt(toMonth.slice(5, 7), 10);
+      let guard = 0;
+      while ((y < ey || (y === ey && m <= em)) && guard++ < 120) {
+        out.push(y + '-' + String(m).padStart(2, '0'));
+        m++; if (m > 12) { m = 1; y++; }
+      }
+      return out;
+    },
+    /* A Xero period-column header ("Aug-26", "31 Aug 2026", "2026-08-31") -> 'YYYY-MM' */
+    _monthKey(label) {
+      const s = String(label == null ? '' : label).trim();
+      let m = /^(\d{4})-(\d{2})/.exec(s);
+      if (m) return m[1] + '-' + m[2];
+      const names = ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec'];
+      m = /([A-Za-z]{3,})[^0-9A-Za-z]*(\d{2,4})/.exec(s);
+      if (m) {
+        const i = names.indexOf(m[1].slice(0, 3).toLowerCase());
+        if (i >= 0) {
+          let y = parseInt(m[2], 10);
+          if (y < 100) y += 2000;
+          return y + '-' + String(i + 1).padStart(2, '0');
+        }
+      }
+      return null;
+    },
+    /* Which of the locked metrics a P&L section feeds. "Other Income" and
+       "Other Expenses" feed nothing - kpi-spec.md keeps them out of Revenue,
+       Overheads and Profit. */
+    _sectionKind(title) {
+      const t = String(title || '').toLowerCase().replace(/^less\s+/, '').trim();
+      if (!t || /other/.test(t)) return null;
+      if (/cost of (sales|goods)/.test(t)) return 'cogs';
+      if (/operating expense|overhead|^expenses?$/.test(t)) return 'opex';
+      if (/income|revenue|sales|turnover/.test(t)) return 'revenue';
+      return null;
+    },
+    /* Wage/super account detection. Keyword match PROPOSES; the owner CONFIRMS
+       the exact list at reconciliation (playbook.md) - that confirmation is
+       what makes Wage % and Overheads reconcile to the cent. */
+    _isWage(label) {
+      return /wage|salar|superannuation|\bsuper\b|payroll|annual leave|long service|work ?cover/i
+        .test(String(label || ''));
+    },
+
+    /* The organisation this dashboard reads, pinned in KV once chosen so a
+       later reconnect cannot silently swap to another org the owner can see. */
+    async _tenant(env, h, force) {
+      if (!force) {
+        const cached = await env.TOKENS.get('xero:tenant');
+        if (cached) { try { return JSON.parse(cached); } catch (e) { /* refetch */ } }
+      }
+      const conns = await h.fetchJson('https://api.xero.com/connections', {
+        headers: { Accept: 'application/json' }
+      });
+      const orgs = (conns || []).filter((c) => !c.tenantType || c.tenantType === 'ORGANISATION');
+      if (!orgs.length) { const e = new Error('no organisation'); e.status = 403; throw e; }
+      const pinnedId = await env.TOKENS.get('xero:tenantId');
+      const chosen = (pinnedId && orgs.find((c) => c.tenantId === pinnedId)) || orgs[0];
+      const rec = { tenantId: chosen.tenantId, tenantName: chosen.tenantName || null };
+      await env.TOKENS.put('xero:tenantId', rec.tenantId);
+      await env.TOKENS.put('xero:tenant', JSON.stringify(rec));
+      return rec;
+    },
+
+    /* Read one amount column out of a ProfitAndLoss ReportWithRows payload.
+       col = 1 for a single-period report; 1..N for a multi-period one. */
+    _parsePL(body, col) {
+      const c = col || 1;
+      const rep = (body && body.Reports && body.Reports[0]) || null;
+      if (!rep) { const e = new Error('unexpected report shape'); e.status = 502; throw e; }
+      const out = { revenue: 0, cogs: 0, wagesSuper: 0, overheads: 0, wageAccounts: [] };
+      for (const sec of (rep.Rows || [])) {
+        if (sec.RowType !== 'Section') continue;
+        const kind = this._sectionKind(sec.Title);
+        if (!kind) continue;
+        let summary = null, sum = 0, wages = 0;
+        for (const row of (sec.Rows || [])) {
+          const cells = row.Cells || [];
+          const label = cells[0] ? String(cells[0].Value || '') : '';
+          const amount = this._num(cells[c] ? cells[c].Value : 0);
+          if (row.RowType === 'SummaryRow') { summary = amount; continue; }
+          if (row.RowType !== 'Row') continue;
+          sum += amount;
+          if (kind === 'opex' && this._isWage(label)) {
+            wages += amount;
+            if (out.wageAccounts.indexOf(label) === -1) out.wageAccounts.push(label);
+          }
+        }
+        const total = (summary === null ? sum : summary);
+        if (kind === 'revenue') out.revenue += total;
+        else if (kind === 'cogs') out.cogs += total;
+        else if (kind === 'opex') { out.wagesSuper += wages; out.overheads += total - wages; }
+      }
+      return out;
+    },
+
+    /* One single-period P&L call (accrual, standard layout). */
+    async _pl(env, h, tenantId, from, to) {
+      const body = await h.fetchJson(
+        'https://api.xero.com/api.xro/2.0/Reports/ProfitAndLoss'
+        + '?fromDate=' + from + '&toDate=' + to + '&standardLayout=true',
+        { headers: { Accept: 'application/json', 'Xero-Tenant-Id': tenantId } }
+      );
+      return this._parsePL(body, 1);
+    },
+
+    /* ---------------- the adapter contract ---------------------------- */
+
+    async status(env, h) {
+      const tokens = await h.getTokens();
+      if (!tokens || !tokens.access_token) return { connected: false };
+      const t = await this._tenant(env, h, true);
+      return {
+        connected: true,
+        org: t.tenantName,
+        sandbox: /demo company/i.test(t.tenantName || '')
+      };
+    },
+
+    async fetchRange(env, h, q) {
+      const t = await this._tenant(env, h);
+      const r = await this._pl(env, h, t.tenantId, q.from, q.to);
+      return {
+        revenue: this._r(r.revenue),
+        cogs: this._r(r.cogs),
+        wagesSuper: this._r(r.wagesSuper),
+        overheads: this._r(r.overheads)
+      };
+    },
+
+    async fetchMonthly(env, h, q) {
+      const t = await this._tenant(env, h);
+      const months = this._monthList(q.fromMonth, q.toMonth);
+      const got = {};
+      try {
+        /* Multi-period reports: Xero caps `periods` at 12, so walk backwards a
+           dozen months at a time. Columns are mapped by their own header date,
+           so the provider's column order never matters. */
+        let guard = 0;
+        while (guard++ < 8) {
+          const missing = months.filter((m) => !got[m]);
+          if (!missing.length) break;
+          const end = missing[missing.length - 1];
+          const n = Math.min(12, missing.length);
+          const body = await h.fetchJson(
+            'https://api.xero.com/api.xro/2.0/Reports/ProfitAndLoss'
+            + '?fromDate=' + this._monthStart(end) + '&toDate=' + this._monthEnd(end)
+            + '&periods=' + n + '&timeframe=MONTH&standardLayout=true',
+            { headers: { Accept: 'application/json', 'Xero-Tenant-Id': t.tenantId } }
+          );
+          const rep = (body && body.Reports && body.Reports[0]) || {};
+          const hdr = (rep.Rows || []).filter((r) => r.RowType === 'Header')[0];
+          const cells = (hdr && hdr.Cells) || [];
+          let mapped = 0;
+          for (let c = 1; c < cells.length; c++) {
+            const key = this._monthKey(cells[c].Value);
+            if (!key) continue;
+            got[key] = this._parsePL(body, c);
+            mapped++;
+          }
+          if (!mapped) { const e = new Error('unmapped period columns'); e.status = 502; throw e; }
+        }
+      } catch (err) {
+        /* Fall back to one call per month - slower, never ambiguous. */
+        for (const mk of months) {
+          if (got[mk]) continue;
+          try { got[mk] = await this._pl(env, h, t.tenantId, this._monthStart(mk), this._monthEnd(mk)); }
+          catch (e2) { got[mk] = null; }
+        }
+      }
+      const pick = (field) => months.map((m) => (got[m] ? this._r(got[m][field]) : null));
+      return {
+        months: months,
+        revenue: pick('revenue'),
+        cogs: pick('cogs'),
+        wagesSuper: pick('wagesSuper'),
+        overheads: pick('overheads')
+      };
+    }
   },
 
   /* >>> ADAPTER 2: POS
