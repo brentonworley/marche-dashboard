@@ -156,10 +156,21 @@ const ADAPTERS = {
     },
     /* Wage/super account detection. Keyword match PROPOSES; the owner CONFIRMS
        the exact list at reconciliation (playbook.md) - that confirmation is
-       what makes Wage % and Overheads reconcile to the cent. */
+       what makes Wage % and Overheads reconcile to the cent.
+
+       Confirmed with the owner, Sept 2026 (Marche Cafe):
+         - "Wages and Salaries" and "Superannuation" -> wages (keyword match)
+         - "Contractor" -> wages. This is front-of-house staff supplied through
+           SUPP who invoice rather than sit on payroll; it is labour, so it
+           belongs in Wage % and NOT in Overheads.
+       Revisit this list with the owner if the chart of accounts changes. */
+    _wageInclude: ['contractor'],
+    _wageExclude: [],
     _isWage(label) {
-      return /wage|salar|superannuation|\bsuper\b|payroll|annual leave|long service|work ?cover/i
-        .test(String(label || ''));
+      const s = String(label || '').toLowerCase();
+      if (this._wageExclude.some((x) => s.indexOf(x) !== -1)) return false;
+      if (this._wageInclude.some((x) => s.indexOf(x) !== -1)) return true;
+      return /wage|salar|superannuation|\bsuper\b|payroll|annual leave|long service|work ?cover/i.test(s);
     },
 
     /* The organisation this dashboard reads, pinned in KV once chosen so a
