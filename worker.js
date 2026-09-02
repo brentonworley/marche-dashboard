@@ -536,10 +536,20 @@ const ADAPTERS = {
          wage % and nothing else; the actual Wage % always comes from Xero.
        - Deputy accepts either "Bearer" or the older "OAuth" auth scheme
          depending on how the token was issued, so we try Bearer and fall back.
-       - Date comparisons use gt/lt against widened bounds rather than ge/le,
-         which are not documented for this resource. */
+       - Roster.Date only honours an EQUALS match; a gt/lt range is silently
+         ignored and Deputy returns its default "next 36 hours" window instead,
+         which reads as a suspiciously small roster. Query day by day. */
   rostering: {
-    configured: true,
+    /* OFF, deliberately - the owner's decision, September 2026.
+       Four full-time staff are on annualised salaries, so their cost does not
+       move with the roster. Deputy can therefore only ever supply the variable
+       slice (casuals, part-timers, agency), and a wage percentage built from
+       that alone is structurally far too low and cannot be read against the
+       owner's target. Rather than show a misleading projection beside a
+       verified actual, the card shows the actual from Xero on its own.
+       Everything below is wired and correct - flip `configured` back to true if
+       full pay rates (or a salaried base) are ever set up in Deputy. */
+    configured: false,
     auth: 'token',
     oauth: {},
 
