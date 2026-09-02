@@ -28,7 +28,7 @@ binding = "TOKENS"
 # and set it below, and push. Otherwise a later deploy can try to re-provision and
 # either error (10014 "namespace already exists") or orphan the namespace holding
 # the dashboard password + connection tokens. Omit once, then pin:
-id = "ce1b269f8b174ce5b7fcb7b66aab87b9"
+# id = "<paste the TOKENS namespace id here after the first deploy>"
 
 # ----------------------------------------------------------------------------
 # Secrets - NEVER written in any file, never committed. You cannot reach the
@@ -57,8 +57,9 @@ id = "ce1b269f8b174ce5b7fcb7b66aab87b9"
 # ----------------------------------------------------------------------------
 # Cron rung (only when an adapter uses scheduledPull to fetch a tool's own
 # export on a schedule). Uncomment and set a sensible cadence:
-# [triggers]
-# crons = ["0 3 * * *"]   # daily, 3am UTC - adjust to land after the tool's
-#                          # own export runs
+[triggers]
+crons = ["23 * * * *"]   # hourly - backfills the Square monthly transaction
+                         # counts into KV so the 24-month trend fills itself in
+                         # without the owner refreshing. Cheap once caught up.
 # ----------------------------------------------------------------------------
 # EOF wrangler.toml

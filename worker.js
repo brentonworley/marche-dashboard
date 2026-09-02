@@ -323,13 +323,191 @@ const ADAPTERS = {
      POS_API_TOKEN); sandbox sign = token only answers on
      connect.squareupsandbox.com.
   */
+  /* WIRED: Square. Verified against Square's current Orders API docs,
+     September 2026.
+       - COUNT ONLY. No dollar figure ever leaves this adapter (kpi-spec.md).
+       - SearchOrders, state_filter COMPLETED, date_time_filter on closed_at,
+         sort CLOSED_AT (Square requires the sort field to match the date
+         filter, and requires a state filter when sorting on CLOSED_AT).
+         CANCELED orders are excluded; refunds are separate records and never
+         reduce the count.
+       - Production host only. A sandbox token simply fails here, which the
+         Connections screen reports as needing reconnecting.
+       - Counting means paging the orders, so monthly counts are cached in KV
+         once a month has closed, and an hourly cron backfills the trend. */
   pos: {
-    configured: false,
-    auth: null,
+    configured: true,
+    auth: 'token',
     oauth: {},
-    async status(env, h) { return { connected: false }; },
-    async fetchRange(env, h, q) { throw new NotConfigured('pos'); },
-    async fetchMonthly(env, h, q) { throw new NotConfigured('pos'); }
+
+    _base: 'https://connect.squareup.com',
+    _hdr(env, extra) {
+      return Object.assign({
+        Authorization: 'Bearer ' + (env.POS_API_TOKEN || ''),
+        Accept: 'application/json'
+      }, extra || {});
+    },
+
+    /* ---- trading-day boundaries in the venue's timezone ---- */
+    _offsetMinutes(tz, when) {
+      const dtf = new Intl.DateTimeFormat('en-US', {
+        timeZone: tz, hour12: false,
+        year: 'numeric', month: '2-digit', day: '2-digit',
+        hour: '2-digit', minute: '2-digit', second: '2-digit'
+      });
+      const p = {};
+      for (const x of dtf.formatToParts(when)) p[x.type] = x.value;
+      const asUTC = Date.UTC(+p.year, +p.month - 1, +p.day, (+p.hour) % 24, +p.minute, +p.second);
+      return Math.round((asUTC - when.getTime()) / 60000);
+    },
+    /* The instant at which local `dateStr` begins, `hour` past midnight
+       (hour = the owner's trading-day rollover). */
+    _instant(tz, dateStr, hour) {
+      const y = +dateStr.slice(0, 4), mo = +dateStr.slice(5, 7), d = +dateStr.slice(8, 10);
+      const wall = Date.UTC(y, mo - 1, d, hour || 0, 0, 0);
+      let ms = wall;
+      for (let i = 0; i < 2; i++) {
+        try { ms = wall - this._offsetMinutes(tz || 'UTC', new Date(ms)) * 60000; }
+        catch (e) { ms = wall; break; }
+      }
+      return new Date(ms).toISOString();
+    },
+    _addDays(dateStr, n) {
+      const d = new Date(dateStr + 'T12:00:00Z');
+      d.setUTCDate(d.getUTCDate() + n);
+      return d.toISOString().slice(0, 10);
+    },
+    _monthStart(mk) { return mk + '-01'; },
+    _monthEnd(mk) {
+      const y = parseInt(mk.slice(0, 4), 10), m = parseInt(mk.slice(5, 7), 10);
+      const d = new Date(Date.UTC(y, m, 0));
+      return mk + '-' + String(d.getUTCDate()).padStart(2, '0');
+    },
+    _monthList(fromMonth, toMonth) {
+      const out = [];
+      let y = parseInt(fromMonth.slice(0, 4), 10), m = parseInt(fromMonth.slice(5, 7), 10);
+      const ey = parseInt(toMonth.slice(0, 4), 10), em = parseInt(toMonth.slice(5, 7), 10);
+      let guard = 0;
+      while ((y < ey || (y === ey && m <= em)) && guard++ < 120) {
+        out.push(y + '-' + String(m).padStart(2, '0'));
+        m++; if (m > 12) { m = 1; y++; }
+      }
+      return out;
+    },
+
+    /* The venue's active Square locations, pinned in KV after the owner
+       confirms them. */
+    async _locations(env, h) {
+      const cached = await env.TOKENS.get('square:locations');
+      if (cached) { try { return JSON.parse(cached); } catch (e) { /* refetch */ } }
+      const body = await h.fetchJson(this._base + '/v2/locations', { headers: this._hdr(env) });
+      const all = (body && body.locations) || [];
+      const active = all.filter((l) => (l.status || 'ACTIVE') === 'ACTIVE');
+      const use = active.length ? active : all;
+      if (!use.length) { const e = new Error('no locations'); e.status = 403; throw e; }
+      const rec = {
+        ids: use.map((l) => l.id).slice(0, 10),
+        label: (use[0].business_name ? use[0].business_name + ' - ' : '')
+          + use.map((l) => l.name).join(', ')
+      };
+      await env.TOKENS.put('square:locations', JSON.stringify(rec));
+      return rec;
+    },
+
+    /* Completed transactions closed between two local dates (inclusive).
+       `b` is a shared page budget so one dashboard load cannot run away with
+       the Worker's subrequest allowance. */
+    async _count(env, h, tz, rollover, from, to, b) {
+      const loc = await this._locations(env, h);
+      const startAt = this._instant(tz, from, rollover);
+      const endAt = this._instant(tz, this._addDays(to, 1), rollover);
+      let cursor = null, total = 0;
+      do {
+        if (b.left <= 0) { const e = new Error('page budget spent'); e.status = 503; throw e; }
+        b.left--;
+        const req = {
+          location_ids: loc.ids,
+          limit: 1000,
+          return_entries: true,
+          query: {
+            filter: {
+              state_filter: { states: ['COMPLETED'] },
+              date_time_filter: { closed_at: { start_at: startAt, end_at: endAt } }
+            },
+            sort: { sort_field: 'CLOSED_AT', sort_order: 'ASC' }
+          }
+        };
+        if (cursor) req.cursor = cursor;
+        const body = await h.fetchJson(this._base + '/v2/orders/search', {
+          method: 'POST',
+          headers: this._hdr(env, { 'Content-Type': 'application/json' }),
+          body: JSON.stringify(req)
+        });
+        total += ((body && (body.order_entries || body.orders)) || []).length;
+        cursor = (body && body.cursor) || null;
+      } while (cursor);
+      return total;
+    },
+
+    _thisMonth() { return new Date().toISOString().slice(0, 10).slice(0, 7); },
+
+    /* Monthly counts, cached in KV. Closed months never change, so they are
+       stored permanently; the current month gets a short TTL. */
+    async _monthCount(env, h, tz, rollover, mk, b) {
+      const key = 'square:count:' + mk;
+      const current = mk >= this._thisMonth();
+      const cached = await env.TOKENS.get(key);
+      if (cached !== null && cached !== undefined) return parseInt(cached, 10);
+      const n = await this._count(env, h, tz, rollover, this._monthStart(mk), this._monthEnd(mk), b);
+      if (current) await env.TOKENS.put(key, String(n), { expirationTtl: 900 });
+      else await env.TOKENS.put(key, String(n));
+      return n;
+    },
+
+    /* ---------------- the adapter contract ---------------------------- */
+
+    async status(env, h) {
+      if (!env.POS_API_TOKEN) return { connected: false };
+      const loc = await this._locations(env, h);
+      return {
+        connected: true,
+        org: loc.label,
+        sandbox: /sandbox|default test account/i.test(loc.label || '')
+      };
+    },
+
+    async fetchRange(env, h, q) {
+      return { count: await this._count(env, h, q.tz, q.rollover, q.from, q.to, { left: 14 }) };
+    },
+
+    async fetchMonthly(env, h, q) {
+      const months = this._monthList(q.fromMonth, q.toMonth);
+      const b = { left: 18 };
+      const out = [];
+      for (const mk of months) {
+        try { out.push(await this._monthCount(env, h, q.tz, q.rollover, mk, b)); }
+        catch (e) { out.push(null); }   /* budget spent or a bad month: honest gap */
+      }
+      return { months: months, count: out };
+    },
+
+    /* Hourly cron: fill in any trend months not cached yet, so the owner does
+       not have to keep refreshing for the history to appear. Once the backfill
+       is done this does almost nothing. */
+    async scheduledPull(env, h) {
+      const tz = (await env.TOKENS.get('sys:tz')) || 'Australia/Melbourne';
+      const rollover = parseInt((await env.TOKENS.get('sys:rollover')) || '0', 10) || 0;
+      const end = new Date();
+      const months = this._monthList(
+        new Date(Date.UTC(end.getUTCFullYear(), end.getUTCMonth() - 24, 1)).toISOString().slice(0, 7),
+        end.toISOString().slice(0, 7)
+      );
+      const b = { left: 40 };
+      for (const mk of months) {
+        if (b.left <= 2) break;
+        try { await this._monthCount(env, h, tz, rollover, mk, b); } catch (e) { break; }
+      }
+    }
   },
 
   /* >>> ADAPTER 3: ROSTERING (optional - only if the owner has one)
