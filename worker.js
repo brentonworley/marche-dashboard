@@ -528,12 +528,92 @@ const ADAPTERS = {
      Wage % from accounting already covers the board (fallback ladder).
      Example (Deputy): pasted permanent token (secret ROSTERING_API_TOKEN).
   */
+  /* WIRED: Deputy. Verified against Deputy's current Resource API docs,
+     September 2026.
+       - permanent token from the install's oauth_clients screen, held in the
+         ROSTERING_API_TOKEN secret
+       - reads the Roster resource only. Rostered cost feeds the PROJECTED
+         wage % and nothing else; the actual Wage % always comes from Xero.
+       - Deputy accepts either "Bearer" or the older "OAuth" auth scheme
+         depending on how the token was issued, so we try Bearer and fall back.
+       - Date comparisons use gt/lt against widened bounds rather than ge/le,
+         which are not documented for this resource. */
   rostering: {
-    configured: false,
-    auth: null,
+    configured: true,
+    auth: 'token',
     oauth: {},
-    async status(env, h) { return { connected: false }; },
-    async fetchRange(env, h, q) { throw new NotConfigured('rostering'); },
+
+    _base: 'https://5d9ced06090332.au.deputy.com',
+
+    async _post(env, h, path, body) {
+      const token = env.ROSTERING_API_TOKEN || '';
+      const call = (scheme) => h.fetchJson(this._base + path, {
+        method: 'POST',
+        headers: {
+          Authorization: scheme + ' ' + token,
+          'Content-Type': 'application/json',
+          Accept: 'application/json'
+        },
+        body: JSON.stringify(body || {})
+      });
+      try { return await call('Bearer'); }
+      catch (e) {
+        if (e && e.status === 401) return await call('OAuth');
+        throw e;
+      }
+    },
+
+    _addDays(dateStr, n) {
+      const d = new Date(dateStr + 'T12:00:00Z');
+      d.setUTCDate(d.getUTCDate() + n);
+      return d.toISOString().slice(0, 10);
+    },
+
+    async status(env, h) {
+      if (!env.ROSTERING_API_TOKEN) return { connected: false };
+      const cached = await env.TOKENS.get('deputy:org');
+      if (cached) return { connected: true, org: cached, sandbox: false };
+      let name = null;
+      try {
+        const rows = await this._post(env, h, '/api/v1/resource/Company/QUERY', { max: 5 });
+        const first = (Array.isArray(rows) ? rows : [])[0];
+        name = (first && (first.CompanyName || first.TradingName || first.Code)) || null;
+      } catch (e) { if (e && e.status === 401) throw e; }
+      name = name || 'Deputy';
+      await env.TOKENS.put('deputy:org', name);
+      return { connected: true, org: name, sandbox: false };
+    },
+
+    /* Rostered labour cost for the period. Deputy's OnCost is the loaded cost
+       (the closest analogue to wages + super); Cost is the bare shift cost. */
+    async fetchRange(env, h, q) {
+      let start = 0, total = 0, guard = 0;
+      for (;;) {
+        if (guard++ > 8) break;
+        const rows = await this._post(env, h, '/api/v1/resource/Roster/QUERY', {
+          search: {
+            s1: { field: 'Date', data: this._addDays(q.from, -1), type: 'gt' },
+            s2: { field: 'Date', data: this._addDays(q.to, 1), type: 'lt' }
+          },
+          sort: { Id: 'asc' },
+          max: 500,
+          start: start
+        });
+        const list = Array.isArray(rows) ? rows : [];
+        for (const r of list) {
+          const v = (r && (r.OnCost !== undefined && r.OnCost !== null ? r.OnCost : r.Cost)) || 0;
+          const n = Number(v);
+          if (isFinite(n)) total += n;
+        }
+        if (list.length < 500) break;
+        start += 500;
+      }
+      return { cost: Math.round(total * 100) / 100 };
+    },
+
+    /* No rostering trend: the projected figure is a "where is this week
+       heading" number, and a 25-month roster history would cost far more
+       calls than it is worth. The actual Wage % already has its own trend. */
     async fetchMonthly(env, h, q) { return { months: [], cost: [] }; }
   }
 };
