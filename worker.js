@@ -584,30 +584,71 @@ const ADAPTERS = {
       return { connected: true, org: name, sandbox: false };
     },
 
-    /* Rostered labour cost for the period. Deputy's OnCost is the loaded cost
-       (the closest analogue to wages + super); Cost is the bare shift cost. */
-    async fetchRange(env, h, q) {
-      let start = 0, total = 0, guard = 0;
-      for (;;) {
-        if (guard++ > 8) break;
-        const rows = await this._post(env, h, '/api/v1/resource/Roster/QUERY', {
-          search: {
-            s1: { field: 'Date', data: this._addDays(q.from, -1), type: 'gt' },
-            s2: { field: 'Date', data: this._addDays(q.to, 1), type: 'lt' }
-          },
-          sort: { Id: 'asc' },
-          max: 500,
-          start: start
+    _todayLocal(tz) {
+      try {
+        const dtf = new Intl.DateTimeFormat('en-CA', {
+          timeZone: tz || 'UTC', year: 'numeric', month: '2-digit', day: '2-digit'
         });
-        const list = Array.isArray(rows) ? rows : [];
-        for (const r of list) {
-          const v = (r && (r.OnCost !== undefined && r.OnCost !== null ? r.OnCost : r.Cost)) || 0;
-          const n = Number(v);
-          if (isFinite(n)) total += n;
-        }
-        if (list.length < 500) break;
-        start += 500;
+        return dtf.format(new Date()).slice(0, 10);
+      } catch (e) { return new Date().toISOString().slice(0, 10); }
+    },
+    _dayList(from, to, cap) {
+      const out = [];
+      let d = from;
+      let guard = 0;
+      while (d <= to && guard++ < 400) {
+        out.push(d);
+        if (out.length > cap) return null;
+        d = this._addDays(d, 1);
       }
+      return out;
+    },
+
+    /* One day of rostered cost. Deputy's Resource API only honours an EQUALS
+       match on Roster.Date - a gt/lt range is silently ignored and you get its
+       default "next 36 hours" window instead, which reads as a suspiciously
+       tiny roster. So we ask day by day. Days already in the past are cached;
+       today and future days move as the roster is edited. */
+    async _dayCost(env, h, day, today) {
+      const key = 'deputy:cost:' + day;
+      const settled = day < today;
+      if (settled) {
+        const cached = await env.TOKENS.get(key);
+        if (cached !== null && cached !== undefined) return parseFloat(cached) || 0;
+      }
+      const rows = await this._post(env, h, '/api/v1/resource/Roster/QUERY', {
+        search: { s1: { field: 'Date', data: day, type: 'eq' } },
+        max: 500
+      });
+      let total = 0;
+      for (const r of (Array.isArray(rows) ? rows : [])) {
+        const v = (r && (r.OnCost !== undefined && r.OnCost !== null ? r.OnCost : r.Cost)) || 0;
+        const n = Number(v);
+        if (isFinite(n)) total += n;
+      }
+      total = Math.round(total * 100) / 100;
+      await env.TOKENS.put(key, String(total), settled ? undefined : { expirationTtl: 1800 });
+      return total;
+    },
+
+    /* Rostered labour cost for the period, for the PROJECTED wage % only.
+       Deputy's OnCost is the loaded cost (the closest analogue to wages plus
+       super); Cost is the bare shift cost.
+
+       Deliberately limited: a projection is a "where is this week heading"
+       number, so it is computed only for periods that reach today or beyond,
+       and only for stretches up to a fortnight. A finished month or last year
+       gets no projection - the actual Wage % from Xero is the real number
+       there, and day-by-day roster calls for a whole year would cost far more
+       than they are worth. Those slots return null, and the card simply shows
+       the actual on its own. */
+    async fetchRange(env, h, q) {
+      const today = this._todayLocal(q.tz);
+      if (q.to < today) { const e = new Error('no projection for a finished period'); e.status = 204; throw e; }
+      const days = this._dayList(q.from, q.to, 14);
+      if (!days) { const e = new Error('period too long to project'); e.status = 204; throw e; }
+      let total = 0;
+      for (const d of days) total += await this._dayCost(env, h, d, today);
       return { cost: Math.round(total * 100) / 100 };
     },
 
