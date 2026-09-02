@@ -428,7 +428,12 @@ const ADAPTERS = {
         const req = {
           location_ids: loc.ids,
           limit: 1000,
-          return_entries: true,
+          /* Full orders, not entries: an order can reach COMPLETED with nothing
+             rung up on it (an open-and-close, a $0 ring). Square's own reporting
+             counts only orders that carry items, and so does the owner's
+             Transactions list - verified against 20 Aug 2026 (Square 148,
+             entries-count 150). So we need line_items to filter on. */
+          return_entries: false,
           query: {
             filter: {
               state_filter: { states: ['COMPLETED'] },
@@ -443,7 +448,11 @@ const ADAPTERS = {
           headers: this._hdr(env, { 'Content-Type': 'application/json' }),
           body: JSON.stringify(req)
         });
-        total += ((body && (body.order_entries || body.orders)) || []).length;
+        for (const o of ((body && body.orders) || [])) {
+          const items = ((o && o.line_items) || []).length;
+          const amount = (o && o.total_money && o.total_money.amount) || 0;
+          if (items > 0 || amount > 0) total++;   /* an empty $0 order is not a sale */
+        }
         cursor = (body && body.cursor) || null;
       } while (cursor);
       return total;
@@ -454,7 +463,7 @@ const ADAPTERS = {
     /* Monthly counts, cached in KV. Closed months never change, so they are
        stored permanently; the current month gets a short TTL. */
     async _monthCount(env, h, tz, rollover, mk, b) {
-      const key = 'square:count:' + mk;
+      const key = 'square:count2:' + mk;
       const current = mk >= this._thisMonth();
       const cached = await env.TOKENS.get(key);
       if (cached !== null && cached !== undefined) return parseInt(cached, 10);
